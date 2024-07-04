@@ -153,7 +153,6 @@ void encodeVideo(const char* inputPath, const char* outputPath) {
     }
 
     // Read and decode frames, then encode and write to muxer
-    size_t bufferSize = 0;
     ssize_t inputIndex = -1;
     ssize_t outputIndex = -1;
     int trackIndex = -1;
@@ -166,21 +165,31 @@ void encodeVideo(const char* inputPath, const char* outputPath) {
         if (!sawInputEOS) {
             ssize_t inputBufferIndex = AMediaCodec_dequeueInputBuffer(decoder, 10000);  // Timeout in microseconds
             if (inputBufferIndex >= 0) {
-                size_t bytesRead = AMediaExtractor_readSampleData(extractor, nullptr, 0);
-                if (bytesRead > 0) {
-                    uint8_t *buffer = new uint8_t[bytesRead];
-                    size_t bytesReadNew = AMediaExtractor_readSampleData(extractor, buffer, bytesRead);
-                    if (bytesReadNew > 0) {
-                        uint8_t *inputBuffer = AMediaCodec_getInputBuffer(decoder, inputBufferIndex, &inputIndex);
-                        memcpy(inputBuffer, buffer, bytesReadNew);
-                        AMediaCodec_queueInputBuffer(decoder, inputBufferIndex, 0, bytesReadNew, AMediaExtractor_getSampleTime(extractor), AMediaExtractor_getSampleFlags(extractor));
-                        AMediaExtractor_advance(extractor);
-                    }
-                    delete[] buffer;
-                } else {
-                    AMediaCodec_queueInputBuffer(decoder, inputBufferIndex, 0, 0, 0, AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM);
+                uint8_t *inputBuffer = AMediaCodec_getInputBuffer(decoder, inputBufferIndex, &inputIndex);
+
+                // Get sample size and time
+                ssize_t sampleSize = AMediaExtractor_getSampleSize(extractor);
+                if (sampleSize < 0) {
                     sawInputEOS = true;
+                    sampleSize = 0;
                 }
+                int64_t sampleTime = AMediaExtractor_getSampleTime(extractor);
+                uint32_t sampleFlags = AMediaExtractor_getSampleFlags(extractor);
+
+                // Copy sample data directly
+                if (sampleSize > 0) {
+                    ssize_t bytesRead = AMediaExtractor_readSampleData(extractor, inputBuffer, sampleSize);
+                    if (bytesRead != sampleSize) {
+                        __android_log_print(ANDROID_LOG_ERROR, "MediaCodec", "Error reading sample data: %zd", bytesRead);
+                        break;
+                    }
+                }
+
+                // Queue input buffer
+                AMediaCodec_queueInputBuffer(decoder, inputBufferIndex, 0, sampleSize, sampleTime, sampleFlags);
+
+                // Advance to the next sample
+                AMediaExtractor_advance(extractor);
             }
         }
 
@@ -219,8 +228,8 @@ void encodeVideo(const char* inputPath, const char* outputPath) {
     }
 
     // Clean up
-    close(inputFd);  // Close the input file descriptor
-    close(outputFd);  // Close the output file descriptor
+    close(inputFd);
+    close(outputFd);
     AMediaCodec_stop(encoder);
     AMediaCodec_delete(encoder);
     AMediaCodec_stop(decoder);
