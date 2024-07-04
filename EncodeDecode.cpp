@@ -5,6 +5,7 @@
 #include <fcntl.h>
 #include <media/NdkMediaCodec.h>
 #include <media/NdkMediaFormat.h>
+#include <media/NdkMediaMuxer.h>
 
 extern "C" {
 
@@ -43,7 +44,7 @@ void encodeVideo(const char* inputPath, const char* outputPath) {
     AMediaCodec *decoder = nullptr;
     AMediaFormat *format = nullptr;
     FILE *inputFile = nullptr;
-    FILE *outputFile = nullptr;
+    AMediaMuxer *muxer = nullptr;
 
     // Open input file (to read decoded frames)
     inputFile = fopen(inputPath, "rb");
@@ -52,20 +53,11 @@ void encodeVideo(const char* inputPath, const char* outputPath) {
         return;
     }
 
-    // Open output file (to write encoded frames)
-    outputFile = fopen(outputPath, "wb");
-    if (!outputFile) {
-        __android_log_print(ANDROID_LOG_ERROR, "MediaCodec", "Failed to open output file");
-        fclose(inputFile);
-        return;
-    }
-
     // Initialize MediaCodec encoder
     encoder = AMediaCodec_createEncoderByType("video/avc");
     if (!encoder) {
         __android_log_print(ANDROID_LOG_ERROR, "MediaCodec", "Failed to create encoder");
         fclose(inputFile);
-        fclose(outputFile);
         return;
     }
 
@@ -85,7 +77,6 @@ void encodeVideo(const char* inputPath, const char* outputPath) {
     if (!decoder) {
         __android_log_print(ANDROID_LOG_ERROR, "MediaCodec", "Failed to create decoder");
         fclose(inputFile);
-        fclose(outputFile);
         AMediaCodec_stop(encoder);
         AMediaCodec_delete(encoder);
         AMediaFormat_delete(format);
@@ -95,13 +86,27 @@ void encodeVideo(const char* inputPath, const char* outputPath) {
     AMediaCodec_configure(decoder, format, nullptr, nullptr, 0);
     AMediaCodec_start(decoder);
 
-    // Read and decode frames
+    // Initialize MediaMuxer for output MP4 file
+    muxer = AMediaMuxer_new(outputPath, AMEDIAMUXER_OUTPUT_FORMAT_MPEG_4);
+    if (!muxer) {
+        __android_log_print(ANDROID_LOG_ERROR, "MediaCodec", "Failed to create muxer");
+        fclose(inputFile);
+        AMediaCodec_stop(encoder);
+        AMediaCodec_delete(encoder);
+        AMediaCodec_stop(decoder);
+        AMediaCodec_delete(decoder);
+        AMediaFormat_delete(format);
+        return;
+    }
+
+    // Read and decode frames, then encode and write to muxer
     size_t bufferSize = 1024 * 1024;  // Adjust buffer size as needed
     uint8_t *buffer = new uint8_t[bufferSize];
     size_t inputBufferSize = 0;
     size_t outputBufferSize = 0;
     ssize_t inputIndex = -1;
     ssize_t outputIndex = -1;
+    int trackIndex = -1;
 
     while (true) {
         ssize_t inputBufferIndex = AMediaCodec_dequeueInputBuffer(decoder, 10000);  // Timeout in microseconds
@@ -122,21 +127,31 @@ void encodeVideo(const char* inputPath, const char* outputPath) {
         ssize_t outputBufferIndex = AMediaCodec_dequeueOutputBuffer(decoder, &info, 10000);
         if (outputBufferIndex >= 0) {
             uint8_t *outputBuffer = AMediaCodec_getOutputBuffer(decoder, outputBufferIndex, &outputIndex);
-            // Encode decoded frames
             ssize_t inputBufferIndex = AMediaCodec_dequeueInputBuffer(encoder, 10000);  // Timeout in microseconds
             if (inputBufferIndex >= 0) {
                 uint8_t *inputBuffer = AMediaCodec_getInputBuffer(encoder, inputBufferIndex, &inputIndex);
                 memcpy(inputBuffer, outputBuffer, info.size);
                 AMediaCodec_queueInputBuffer(encoder, inputBufferIndex, 0, info.size, 0, 0);
-            }
 
+                // Write encoded frame to muxer
+                AMediaCodecBufferInfo encodeInfo;
+                ssize_t encodeOutputIndex = AMediaCodec_dequeueOutputBuffer(encoder, &encodeInfo, 10000);
+                if (encodeOutputIndex >= 0) {
+                    size_t encodedDataSize;
+                    uint8_t *encodedData = AMediaCodec_getOutputBuffer(encoder, encodeOutputIndex, &encodedDataSize);
+                    AMediaMuxer_writeSampleData(muxer, trackIndex, encodedData, &encodeInfo);
+                    AMediaCodec_releaseOutputBuffer(encoder, encodeOutputIndex, false);
+                }
+            }
             AMediaCodec_releaseOutputBuffer(decoder, outputBufferIndex, false);
             if (info.flags & AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM) {
                 break;
             }
         } else if (outputBufferIndex == AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED) {
             AMediaFormat *format = AMediaCodec_getOutputFormat(decoder);
-            // Handle output format change if needed
+            // Add track to muxer
+            trackIndex = AMediaMuxer_addTrack(muxer, format);
+            AMediaMuxer_start(muxer);
         } else if (outputBufferIndex == AMEDIACODEC_INFO_TRY_AGAIN_LATER) {
             // Handle timeout
         }
@@ -146,12 +161,13 @@ void encodeVideo(const char* inputPath, const char* outputPath) {
 
     // Clean up
     fclose(inputFile);
-    fclose(outputFile);
     AMediaCodec_stop(encoder);
     AMediaCodec_delete(encoder);
     AMediaCodec_stop(decoder);
     AMediaCodec_delete(decoder);
     AMediaFormat_delete(format);
+    AMediaMuxer_stop(muxer);
+    AMediaMuxer_delete(muxer);
 }
 
 void decodeVideo(const char* inputPath, const char* outputPath) {
@@ -159,3 +175,4 @@ void decodeVideo(const char* inputPath, const char* outputPath) {
 }
 
 } // extern "C"
+
