@@ -198,4 +198,7 @@ void encodeVideo(const char* inputPath, const char* outputPath) {
 }
 
 void decodeVideo(const char* inputPath, const char* outputPath) {
-    // Function not implemented in this
+    // Function not implemented in this example
+}
+
+} // extern "C"
