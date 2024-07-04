@@ -5,6 +5,7 @@
 #include <fcntl.h>
 #include <media/NdkMediaCodec.h>
 #include <media/NdkMediaFormat.h>
+#include <media/NdkMediaExtractor.h>
 #include <media/NdkMediaMuxer.h>
 
 extern "C" {
@@ -40,24 +41,46 @@ Java_com_example_mediaprocessing_MediaCodecHelper_nativeDecodeVideo(JNIEnv *env,
 }
 
 void encodeVideo(const char* inputPath, const char* outputPath) {
+    AMediaExtractor *extractor = nullptr;
     AMediaCodec *encoder = nullptr;
     AMediaCodec *decoder = nullptr;
     AMediaFormat *format = nullptr;
-    FILE *inputFile = nullptr;
     AMediaMuxer *muxer = nullptr;
 
-    // Open input file (to read decoded frames)
-    inputFile = fopen(inputPath, "rb");
-    if (!inputFile) {
-        __android_log_print(ANDROID_LOG_ERROR, "MediaCodec", "Failed to open input file");
+    // Initialize MediaExtractor
+    extractor = AMediaExtractor_new();
+    media_status_t status = AMediaExtractor_setDataSource(extractor, inputPath);
+    if (status != AMEDIA_OK) {
+        __android_log_print(ANDROID_LOG_ERROR, "MediaCodec", "Failed to set data source");
         return;
     }
+
+    // Get video track format from extractor
+    int trackCount = AMediaExtractor_getTrackCount(extractor);
+    AMediaFormat *trackFormat = nullptr;
+    int videoTrackIndex = -1;
+    for (int i = 0; i < trackCount; ++i) {
+        trackFormat = AMediaExtractor_getTrackFormat(extractor, i);
+        const char *mime;
+        if (AMediaFormat_getString(trackFormat, AMEDIAFORMAT_KEY_MIME, &mime) && !strncmp(mime, "video/", 6)) {
+            videoTrackIndex = i;
+            break;
+        }
+    }
+
+    if (videoTrackIndex < 0) {
+        __android_log_print(ANDROID_LOG_ERROR, "MediaCodec", "No video track found");
+        AMediaExtractor_delete(extractor);
+        return;
+    }
+
+    AMediaExtractor_selectTrack(extractor, videoTrackIndex);
 
     // Initialize MediaCodec encoder
     encoder = AMediaCodec_createEncoderByType("video/avc");
     if (!encoder) {
         __android_log_print(ANDROID_LOG_ERROR, "MediaCodec", "Failed to create encoder");
-        fclose(inputFile);
+        AMediaExtractor_delete(extractor);
         return;
     }
 
@@ -76,25 +99,25 @@ void encodeVideo(const char* inputPath, const char* outputPath) {
     decoder = AMediaCodec_createDecoderByType("video/avc");
     if (!decoder) {
         __android_log_print(ANDROID_LOG_ERROR, "MediaCodec", "Failed to create decoder");
-        fclose(inputFile);
         AMediaCodec_stop(encoder);
         AMediaCodec_delete(encoder);
+        AMediaExtractor_delete(extractor);
         AMediaFormat_delete(format);
         return;
     }
 
-    AMediaCodec_configure(decoder, format, nullptr, nullptr, 0);
+    AMediaCodec_configure(decoder, trackFormat, nullptr, nullptr, 0);
     AMediaCodec_start(decoder);
 
     // Initialize MediaMuxer for output MP4 file
     muxer = AMediaMuxer_new(outputPath, AMEDIAMUXER_OUTPUT_FORMAT_MPEG_4);
     if (!muxer) {
         __android_log_print(ANDROID_LOG_ERROR, "MediaCodec", "Failed to create muxer");
-        fclose(inputFile);
         AMediaCodec_stop(encoder);
         AMediaCodec_delete(encoder);
         AMediaCodec_stop(decoder);
         AMediaCodec_delete(decoder);
+        AMediaExtractor_delete(extractor);
         AMediaFormat_delete(format);
         return;
     }
@@ -102,36 +125,40 @@ void encodeVideo(const char* inputPath, const char* outputPath) {
     // Read and decode frames, then encode and write to muxer
     size_t bufferSize = 1024 * 1024;  // Adjust buffer size as needed
     uint8_t *buffer = new uint8_t[bufferSize];
-    size_t inputBufferSize = 0;
-    size_t outputBufferSize = 0;
     ssize_t inputIndex = -1;
     ssize_t outputIndex = -1;
     int trackIndex = -1;
 
-    while (true) {
-        ssize_t inputBufferIndex = AMediaCodec_dequeueInputBuffer(decoder, 10000);  // Timeout in microseconds
-        if (inputBufferIndex >= 0) {
-            size_t bytesRead = fread(buffer, 1, bufferSize, inputFile);
-            if (bytesRead > 0) {
-                inputBufferSize = bytesRead;
-                uint8_t *inputBuffer = AMediaCodec_getInputBuffer(decoder, inputBufferIndex, &inputIndex);
-                memcpy(inputBuffer, buffer, inputBufferSize);
-                AMediaCodec_queueInputBuffer(decoder, inputBufferIndex, 0, inputBufferSize, 0, 0);
-            } else {
-                AMediaCodec_queueInputBuffer(decoder, inputBufferIndex, 0, 0, 0, AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM);
-                break;
+    AMediaCodecBufferInfo info;
+    bool sawInputEOS = false;
+    bool sawOutputEOS = false;
+
+    while (!sawOutputEOS) {
+        if (!sawInputEOS) {
+            ssize_t inputBufferIndex = AMediaCodec_dequeueInputBuffer(decoder, 10000);  // Timeout in microseconds
+            if (inputBufferIndex >= 0) {
+                size_t bytesRead = AMediaExtractor_readSampleData(extractor, buffer, bufferSize);
+                if (bytesRead > 0) {
+                    uint8_t *inputBuffer = AMediaCodec_getInputBuffer(decoder, inputBufferIndex, &inputIndex);
+                    memcpy(inputBuffer, buffer, bytesRead);
+                    AMediaCodec_queueInputBuffer(decoder, inputBufferIndex, 0, bytesRead, AMediaExtractor_getSampleTime(extractor), AMediaExtractor_getSampleFlags(extractor));
+                    AMediaExtractor_advance(extractor);
+                } else {
+                    AMediaCodec_queueInputBuffer(decoder, inputBufferIndex, 0, 0, 0, AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM);
+                    sawInputEOS = true;
+                }
             }
         }
 
-        AMediaCodecBufferInfo info;
         ssize_t outputBufferIndex = AMediaCodec_dequeueOutputBuffer(decoder, &info, 10000);
         if (outputBufferIndex >= 0) {
             uint8_t *outputBuffer = AMediaCodec_getOutputBuffer(decoder, outputBufferIndex, &outputIndex);
+
             ssize_t inputBufferIndex = AMediaCodec_dequeueInputBuffer(encoder, 10000);  // Timeout in microseconds
             if (inputBufferIndex >= 0) {
                 uint8_t *inputBuffer = AMediaCodec_getInputBuffer(encoder, inputBufferIndex, &inputIndex);
                 memcpy(inputBuffer, outputBuffer, info.size);
-                AMediaCodec_queueInputBuffer(encoder, inputBufferIndex, 0, info.size, 0, 0);
+                AMediaCodec_queueInputBuffer(encoder, inputBufferIndex, 0, info.size, info.presentationTimeUs, 0);
 
                 // Write encoded frame to muxer
                 AMediaCodecBufferInfo encodeInfo;
@@ -143,13 +170,13 @@ void encodeVideo(const char* inputPath, const char* outputPath) {
                     AMediaCodec_releaseOutputBuffer(encoder, encodeOutputIndex, false);
                 }
             }
+
             AMediaCodec_releaseOutputBuffer(decoder, outputBufferIndex, false);
             if (info.flags & AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM) {
-                break;
+                sawOutputEOS = true;
             }
         } else if (outputBufferIndex == AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED) {
             AMediaFormat *format = AMediaCodec_getOutputFormat(decoder);
-            // Add track to muxer
             trackIndex = AMediaMuxer_addTrack(muxer, format);
             AMediaMuxer_start(muxer);
         } else if (outputBufferIndex == AMEDIACODEC_INFO_TRY_AGAIN_LATER) {
@@ -160,19 +187,15 @@ void encodeVideo(const char* inputPath, const char* outputPath) {
     delete[] buffer;
 
     // Clean up
-    fclose(inputFile);
     AMediaCodec_stop(encoder);
     AMediaCodec_delete(encoder);
     AMediaCodec_stop(decoder);
     AMediaCodec_delete(decoder);
+    AMediaExtractor_delete(extractor);
     AMediaFormat_delete(format);
     AMediaMuxer_stop(muxer);
     AMediaMuxer_delete(muxer);
 }
 
 void decodeVideo(const char* inputPath, const char* outputPath) {
-    // Function not implemented in this scenario, as decoding will be done in encodeVideo function.
-}
-
-} // extern "C"
-
+    // Function not implemented in this
