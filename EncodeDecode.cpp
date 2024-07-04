@@ -14,6 +14,8 @@ extern "C" {
 void encodeVideo(const char* inputPath, const char* outputPath);
 void decodeVideo(const char* inputPath, const char* outputPath);
 
+int openOutputFile(const char* outputPath);
+
 JNIEXPORT void JNICALL
 Java_com_example_mediaprocessing_MediaCodecHelper_nativeEncodeVideo(JNIEnv *env, jobject /* this */,
                                                                     jstring inputPath_,
@@ -109,10 +111,24 @@ void encodeVideo(const char* inputPath, const char* outputPath) {
     AMediaCodec_configure(decoder, trackFormat, nullptr, nullptr, 0);
     AMediaCodec_start(decoder);
 
-    // Initialize MediaMuxer for output MP4 file
-    muxer = AMediaMuxer_new(outputPath, AMEDIAMUXER_OUTPUT_FORMAT_MPEG_4);
+    // Open output file and get file descriptor
+    int outputFd = openOutputFile(outputPath);
+    if (outputFd < 0) {
+        __android_log_print(ANDROID_LOG_ERROR, "MediaCodec", "Failed to open output file");
+        AMediaCodec_stop(encoder);
+        AMediaCodec_delete(encoder);
+        AMediaCodec_stop(decoder);
+        AMediaCodec_delete(decoder);
+        AMediaExtractor_delete(extractor);
+        AMediaFormat_delete(format);
+        return;
+    }
+
+    // Initialize MediaMuxer from FD for output MP4 file
+    muxer = AMediaMuxer_newFromFd(outputFd, AMEDIAMUXER_OUTPUT_FORMAT_MPEG_4);
     if (!muxer) {
         __android_log_print(ANDROID_LOG_ERROR, "MediaCodec", "Failed to create muxer");
+        close(outputFd);
         AMediaCodec_stop(encoder);
         AMediaCodec_delete(encoder);
         AMediaCodec_stop(decoder);
@@ -195,10 +211,21 @@ void encodeVideo(const char* inputPath, const char* outputPath) {
     AMediaFormat_delete(format);
     AMediaMuxer_stop(muxer);
     AMediaMuxer_delete(muxer);
+
+    close(outputFd);  // Close the output file descriptor
 }
 
 void decodeVideo(const char* inputPath, const char* outputPath) {
     // Function not implemented in this example
+}
+
+// Helper function to open output file and return file descriptor
+int openOutputFile(const char* outputPath) {
+    int outputFd = open(outputPath, O_CREAT | O_WRONLY | O_TRUNC, S_IRUSR | S_IWUSR);
+    if (outputFd < 0) {
+        __android_log_print(ANDROID_LOG_ERROR, "MediaCodec", "Failed to open output file: %s", strerror(errno));
+    }
+    return outputFd;
 }
 
 } // extern "C"
