@@ -1,8 +1,8 @@
 #include <jni.h>
-#include <string>
 #include <android/log.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <media/NdkMediaCodec.h>
 #include <media/NdkMediaFormat.h>
 #include <media/NdkMediaExtractor.h>
@@ -15,6 +15,7 @@ void encodeVideo(const char* inputPath, const char* outputPath);
 void decodeVideo(const char* inputPath, const char* outputPath);
 
 int openOutputFile(const char* outputPath);
+size_t getFileSize(const char* filePath);
 
 JNIEXPORT void JNICALL
 Java_com_example_mediaprocessing_MediaCodecHelper_nativeEncodeVideo(JNIEnv *env, jobject /* this */,
@@ -49,11 +50,19 @@ void encodeVideo(const char* inputPath, const char* outputPath) {
     AMediaFormat *format = nullptr;
     AMediaMuxer *muxer = nullptr;
 
-    // Initialize MediaExtractor
+    // Open input file and get file descriptor
+    int inputFd = open(inputPath, O_RDONLY);
+    if (inputFd < 0) {
+        __android_log_print(ANDROID_LOG_ERROR, "MediaCodec", "Failed to open input file: %s", strerror(errno));
+        return;
+    }
+
+    // Initialize MediaExtractor from FD
     extractor = AMediaExtractor_new();
-    media_status_t status = AMediaExtractor_setDataSource(extractor, inputPath);
+    media_status_t status = AMediaExtractor_setDataSourceFd(extractor, inputFd, 0, getFileSize(inputPath));
     if (status != AMEDIA_OK) {
-        __android_log_print(ANDROID_LOG_ERROR, "MediaCodec", "Failed to set data source");
+        __android_log_print(ANDROID_LOG_ERROR, "MediaCodec", "Failed to set data source for %s", inputPath);
+        close(inputFd);
         return;
     }
 
@@ -72,6 +81,7 @@ void encodeVideo(const char* inputPath, const char* outputPath) {
 
     if (videoTrackIndex < 0) {
         __android_log_print(ANDROID_LOG_ERROR, "MediaCodec", "No video track found");
+        close(inputFd);
         AMediaExtractor_delete(extractor);
         return;
     }
@@ -82,6 +92,7 @@ void encodeVideo(const char* inputPath, const char* outputPath) {
     encoder = AMediaCodec_createEncoderByType("video/avc");
     if (!encoder) {
         __android_log_print(ANDROID_LOG_ERROR, "MediaCodec", "Failed to create encoder");
+        close(inputFd);
         AMediaExtractor_delete(extractor);
         return;
     }
@@ -101,6 +112,7 @@ void encodeVideo(const char* inputPath, const char* outputPath) {
     decoder = AMediaCodec_createDecoderByType("video/avc");
     if (!decoder) {
         __android_log_print(ANDROID_LOG_ERROR, "MediaCodec", "Failed to create decoder");
+        close(inputFd);
         AMediaCodec_stop(encoder);
         AMediaCodec_delete(encoder);
         AMediaExtractor_delete(extractor);
@@ -115,6 +127,7 @@ void encodeVideo(const char* inputPath, const char* outputPath) {
     int outputFd = openOutputFile(outputPath);
     if (outputFd < 0) {
         __android_log_print(ANDROID_LOG_ERROR, "MediaCodec", "Failed to open output file");
+        close(inputFd);
         AMediaCodec_stop(encoder);
         AMediaCodec_delete(encoder);
         AMediaCodec_stop(decoder);
@@ -128,6 +141,7 @@ void encodeVideo(const char* inputPath, const char* outputPath) {
     muxer = AMediaMuxer_newFromFd(outputFd, AMEDIAMUXER_OUTPUT_FORMAT_MPEG_4);
     if (!muxer) {
         __android_log_print(ANDROID_LOG_ERROR, "MediaCodec", "Failed to create muxer");
+        close(inputFd);
         close(outputFd);
         AMediaCodec_stop(encoder);
         AMediaCodec_delete(encoder);
@@ -139,8 +153,7 @@ void encodeVideo(const char* inputPath, const char* outputPath) {
     }
 
     // Read and decode frames, then encode and write to muxer
-    size_t bufferSize = 1024 * 1024;  // Adjust buffer size as needed
-    uint8_t *buffer = new uint8_t[bufferSize];
+    size_t bufferSize = 0;
     ssize_t inputIndex = -1;
     ssize_t outputIndex = -1;
     int trackIndex = -1;
@@ -153,12 +166,17 @@ void encodeVideo(const char* inputPath, const char* outputPath) {
         if (!sawInputEOS) {
             ssize_t inputBufferIndex = AMediaCodec_dequeueInputBuffer(decoder, 10000);  // Timeout in microseconds
             if (inputBufferIndex >= 0) {
-                size_t bytesRead = AMediaExtractor_readSampleData(extractor, buffer, bufferSize);
+                size_t bytesRead = AMediaExtractor_readSampleData(extractor, nullptr, 0);
                 if (bytesRead > 0) {
-                    uint8_t *inputBuffer = AMediaCodec_getInputBuffer(decoder, inputBufferIndex, &inputIndex);
-                    memcpy(inputBuffer, buffer, bytesRead);
-                    AMediaCodec_queueInputBuffer(decoder, inputBufferIndex, 0, bytesRead, AMediaExtractor_getSampleTime(extractor), AMediaExtractor_getSampleFlags(extractor));
-                    AMediaExtractor_advance(extractor);
+                    uint8_t *buffer = new uint8_t[bytesRead];
+                    size_t bytesReadNew = AMediaExtractor_readSampleData(extractor, buffer, bytesRead);
+                    if (bytesReadNew > 0) {
+                        uint8_t *inputBuffer = AMediaCodec_getInputBuffer(decoder, inputBufferIndex, &inputIndex);
+                        memcpy(inputBuffer, buffer, bytesReadNew);
+                        AMediaCodec_queueInputBuffer(decoder, inputBufferIndex, 0, bytesReadNew, AMediaExtractor_getSampleTime(extractor), AMediaExtractor_getSampleFlags(extractor));
+                        AMediaExtractor_advance(extractor);
+                    }
+                    delete[] buffer;
                 } else {
                     AMediaCodec_queueInputBuffer(decoder, inputBufferIndex, 0, 0, 0, AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM);
                     sawInputEOS = true;
@@ -200,9 +218,9 @@ void encodeVideo(const char* inputPath, const char* outputPath) {
         }
     }
 
-    delete[] buffer;
-
     // Clean up
+    close(inputFd);  // Close the input file descriptor
+    close(outputFd);  // Close the output file descriptor
     AMediaCodec_stop(encoder);
     AMediaCodec_delete(encoder);
     AMediaCodec_stop(decoder);
@@ -211,8 +229,6 @@ void encodeVideo(const char* inputPath, const char* outputPath) {
     AMediaFormat_delete(format);
     AMediaMuxer_stop(muxer);
     AMediaMuxer_delete(muxer);
-
-    close(outputFd);  // Close the output file descriptor
 }
 
 void decodeVideo(const char* inputPath, const char* outputPath) {
@@ -226,6 +242,15 @@ int openOutputFile(const char* outputPath) {
         __android_log_print(ANDROID_LOG_ERROR, "MediaCodec", "Failed to open output file: %s", strerror(errno));
     }
     return outputFd;
+}
+
+// Helper function to get file size
+size_t getFileSize(const char* filePath) {
+    struct stat st;
+    if (stat(filePath, &st) == 0) {
+        return st.st_size;
+    }
+    return 0;
 }
 
 } // extern "C"
