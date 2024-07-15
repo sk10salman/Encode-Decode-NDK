@@ -35,6 +35,8 @@ void dumpFrame(uint8_t* frameData, int width, int height, int frameNumber) {
 
 // Function to render OpenGL frame
 void renderFrame(uint8_t* frameData, int width, int height) {
+    // Process frame data (if needed)
+
     // Clear the color buffer
     glClear(GL_COLOR_BUFFER_BIT);
 
@@ -146,9 +148,8 @@ void renderFrame(uint8_t* frameData, int width, int height) {
     glDeleteBuffers(1, &vbo);
     glDeleteVertexArrays(1, &vao);
 
-    // Dump frame to file
-    static int frameCount = 0;
-    dumpFrame(frameData, width, height, frameCount++);
+    // Dump frame
+    dumpFrame(frameData, width, height, 0); // Adjust frame number as needed
 }
 
 // JNI function to decode video, render frames, and dump each frame
@@ -216,7 +217,7 @@ Java_your_package_name_VideoRendererActivity_renderAndDumpFrames(JNIEnv *env, jo
             size_t out_size;
             uint8_t *out_data = AMediaCodec_getOutputBuffer(codec, outIdx, &out_size);
             if (out_size > 0) {
-                // Render the frame and dump it
+                // Render the frame
                 renderFrame(out_data, info.width, info.height);
             }
             AMediaCodec_releaseOutputBuffer(codec, outIdx, false);
